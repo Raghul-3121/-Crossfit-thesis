@@ -1,0 +1,303 @@
+---
+title: "CrossFit Gym Attendance Analysis"
+author: "Raghul Senthilvel"
+date: "August 07, 2025"
+output: html_notebook
+---
+
+```{r setup, include=FALSE}
+# ---- Libraries ----
+library(tidyverse)
+library(lubridate)
+library(cluster)
+library(factoextra)
+library(ggplot2)
+library(viridis)
+library(tidyr)
+library(forcats)
+set.seed(123)
+```
+
+# Initial cleaning and pre-processing.
+# 1. Coerce Client ID to character to avoid type mismatch errors in joins.
+# 2. Convert start datetime to Date for easier aggregation.
+# 3. Remove any records missing critical fields or from non-analysed gyms (Dunleer excluded).
+
+```{r}
+# Loading the raw attendance data. 
+df <- read_csv("Data ranges 23 to 25.csv", locale = locale(encoding = "UTF-8"))
+
+df_clean <- df %>%
+  mutate(
+    `Client ID` = as.character(`Client ID`),
+    `Start Datetime` = ymd_hms(`Start Datetime`, quiet = TRUE),
+    Date = as.Date(`Start Datetime`)
+  ) %>%
+  select(`Client ID`, Date, Location, Status, `Membership Type`) %>%
+  drop_na() %>%
+  filter(Location != "Bua Dunleer")
+
+```
+
+# 2. Exploratory Data Analysis (EDA)
+# Weekly Attendance Patterns
+```{r}
+df_clean <- df_clean %>%
+  mutate(day_of_week = wday(Date, label = TRUE, abbr = TRUE, week_start = 1))
+
+attendance_dow <- df_clean %>%
+  group_by(Location, day_of_week) %>%
+  summarise(Attendances = n(), .groups = "drop")
+
+ggplot(attendance_dow, aes(day_of_week, Attendances, fill = Location)) +
+  geom_col(show.legend = FALSE) +
+  geom_text(aes(label = Attendances), vjust = -0.5, size = 3) +
+  facet_wrap(~ Location, scales = "free_y") +
+  labs(title = "Figure 1: Weekly Attendance by Day of Week", x = "Day", y = "Attendance") +
+  theme_minimal()
+```
+
+# First Active Month by Gym
+```{r}
+# Find the first active month for each client at each location.
+first_active <- df_clean %>%
+  group_by(`Client ID`, Location) %>%
+  summarise(first_active = floor_date(min(Date), "month"), .groups = "drop") %>%
+  count(Location, first_active) %>%
+  filter(first_active > min(first_active))
+
+ggplot(first_active, aes(first_active, n, fill = Location)) +
+  geom_col() +
+  facet_wrap(~ Location, scales = "free_y") +
+  labs(title = "Figure 2: New Clients per Month", x = "Month", y = "Client Count") +
+  theme_minimal()
+```
+
+# Drop-off Month by Gym
+```{r}
+# Identify when clients stopped attending.
+
+last_active <- df_clean %>%
+  group_by(`Client ID`, Location) %>%
+  summarise(last_active = floor_date(max(Date), "month"), .groups = "drop") %>%
+  count(Location, last_active) %>%
+  filter(last_active < max(last_active))
+
+ggplot(last_active, aes(last_active, n, fill = Location)) +
+  geom_col() +
+  facet_wrap(~ Location, scales = "free_y") +
+  labs(title = "Figure 3: Drop-offs per Month", x = "Month", y = "Client Count") +
+  theme_minimal()
+```
+
+# 3. Weekly Matrix Construction for Clustering
+```{r}
+# Construct a full client-week matrix (including weeks with zero attendance for each client).
+weekly_attendance <- df_clean %>%
+  mutate(week = floor_date(Date, "week")) %>%
+  group_by(`Client ID`, week) %>%
+  summarise(weekly_visits = n(), .groups = "drop")
+
+all_weeks <- tibble(week = seq.Date(min(weekly_attendance$week), max(weekly_attendance$week), by = "week"))
+clients <- weekly_attendance %>% distinct(`Client ID`)
+full_grid <- crossing(`Client ID` = clients$`Client ID`, week = all_weeks$week)
+
+full_grid <- full_grid %>% mutate(`Client ID` = as.character(`Client ID`))
+weekly_attendance <- weekly_attendance %>% mutate(`Client ID` = as.character(`Client ID`))
+
+weekly_full <- full_grid %>%
+  left_join(weekly_attendance, by = c("Client ID", "week")) %>%
+  mutate(weekly_visits = replace_na(weekly_visits, 0))
+
+# ---- Matrix for K-means ----
+client_weekly_matrix <- weekly_full %>%
+  pivot_wider(names_from = week, values_from = weekly_visits, values_fill = 0)
+
+attendance_matrix <- as.matrix(client_weekly_matrix %>% select(-`Client ID`))
+attendance_matrix_scaled <- scale(attendance_matrix)
+
+```
+
+# Elbow Method for K-Selection
+## The elbow plot helps justify the choice of K=3 as an inflection point in within-cluster sum of squares.
+```{r}
+# ---- Clustering: K-means, Elbow, Silhouette ----
+wss <- sapply(1:10, function(k){
+  kmeans(attendance_matrix_scaled, centers = k, nstart = 20)$tot.withinss
+})
+elbow_df <- data.frame(k = 1:10, wss = wss)
+
+ggplot(elbow_df, aes(x = k, y = wss)) +
+  geom_line(size = 1) +
+  geom_point(size = 2) +
+  labs(title = "Figure 4: Elbow Plot for K-means Clustering", x = "K", y = "Within-Cluster Sum of Squares") +
+  theme_minimal()
+
+```
+
+# Silhouette Validation
+```{r}
+kmeans_result <- kmeans(attendance_matrix_scaled, centers = 3, nstart = 50)
+client_weekly_clustered <- client_weekly_matrix %>%
+  mutate(Cluster = factor(kmeans_result$cluster))
+
+sil <- silhouette(as.numeric(client_weekly_clustered$Cluster), dist(attendance_matrix_scaled))
+fviz_silhouette(sil)
+```
+
+# PCA Visualisation
+```{r}
+pca <- prcomp(attendance_matrix_scaled)
+pca_df <- data.frame(pca$x[,1:2], Cluster = client_weekly_clustered$Cluster, ClientID = client_weekly_clustered$`Client ID`)
+ggplot(pca_df, aes(PC1, PC2, color = Cluster)) +
+  geom_point(alpha = 0.7) +
+  labs(title = "Figure 6: PCA of Clients Colored by Cluster") +
+  theme_minimal()
+```
+
+# Consistency Metrics and Cluster Profiling
+# ICV is used here to robustly capture attendance regularity; a key element distinguishing LVHC clients.
+
+```{r}
+# Profile each client: mean attendance, variability, presence ratio, and ICV.
+client_metrics <- weekly_full %>%
+  group_by(`Client ID`) %>%
+  summarise(
+    mean_visits = mean(weekly_visits),
+    sd_visits = sd(weekly_visits),
+    presence_ratio = mean(weekly_visits > 0),
+    ICV = ifelse(sd_visits == 0, mean_visits + 0.01, mean_visits / sd_visits),
+    .groups = "drop"
+  ) %>%
+  left_join(client_weekly_clustered %>% select(`Client ID`, Cluster), by = "Client ID")
+
+cluster_means <- client_metrics %>%
+  group_by(Cluster) %>%
+  summarise(mean_ICV = mean(ICV, na.rm = TRUE), .groups = "drop")
+
+ggplot(client_metrics, aes(x = ICV, fill = Cluster, color = Cluster)) +
+  geom_density(alpha = 0.3, linewidth = 1) +
+  geom_vline(data = cluster_means,
+             aes(xintercept = mean_ICV, color = Cluster),
+             linetype = "dashed", linewidth = 1) +
+  labs(title = "Figure 8: Inverse Coefficient of Variation (ICV) Density by Cluster",
+       x = "ICV (Mean / SD)", y = "Density") +
+  theme_minimal()
+
+
+```
+
+# Identify LVHC clients: low-volume, high-consistency per academic definition.
+
+```{r}
+#  LVHC Identification
+lvhc_clients <- client_metrics %>%
+  filter(mean_visits <= 2, ICV >= 1, presence_ratio >= 0.7) %>%
+  mutate(`Client ID` = as.character(`Client ID`))
+
+df_clean_ids <- df_clean %>%
+  select(`Client ID`, Location) %>%
+  distinct() %>%
+  mutate(`Client ID` = as.character(`Client ID`), Location = as.character(Location))
+
+lvhc_visits <- weekly_full %>%
+  filter(`Client ID` %in% lvhc_clients$`Client ID`) %>%
+  left_join(df_clean_ids, by = "Client ID") %>%
+  group_by(`Client ID`, Location) %>%
+  summarise(total_visits = sum(weekly_visits), .groups = "drop")
+
+top5_lvhc_per_gym <- lvhc_visits %>%
+  group_by(Location) %>%
+  slice_max(order_by = total_visits, n = 5) %>%
+  ungroup() %>%
+  mutate(`Client ID` = as.character(`Client ID`),
+         `Client ID` = fct_reorder(`Client ID`, total_visits))
+
+```
+
+# Barplot highlights consistent but lower-volume clients. These clients are the core group for retention analysis.
+
+```{r}
+##Barplot of Top LVHCs
+ggplot(top5_lvhc_per_gym, aes(x = total_visits, y = `Client ID`)) +
+  geom_col(fill = "#4a90e2") +
+  facet_wrap(~ Location, scales = "free_y") +
+  labs(
+    title = "Figure 9: Top 5 LVHC Clients per Gym",
+    x = "Total Visits", y = "Client ID"
+  ) +
+  theme_minimal()
+
+```
+
+# Build a matrix for weekly attendance heatmap of top LVHCs.
+
+```{r}
+lvhc_heatmap_data <- weekly_full %>%
+  left_join(df_clean_ids, by = "Client ID") %>%
+  semi_join(top5_lvhc_per_gym, by = c("Client ID", "Location")) %>%
+  mutate(label = paste0(`Client ID`, " (", Location, ")"))
+
+lvhc_heatmap_data$label <- factor(
+  lvhc_heatmap_data$label,
+  levels = unique(lvhc_heatmap_data$label[order(lvhc_heatmap_data$Location, lvhc_heatmap_data$`Client ID`)])
+)
+
+ggplot(lvhc_heatmap_data, aes(x = week, y = label, fill = weekly_visits)) +
+  geom_tile() +
+  scale_fill_viridis(name = "Visits/Week", option = "plasma", limits = c(0, 5)) +
+  labs(title = "Figure 10: Weekly Attendance Heatmap of Top LVHC Clients", x = "Week", y = "Client (Gym)") +
+  theme_minimal()
+
+```
+# Detect clients at risk of churn (no visits in past 4+ weeks).
+```{r}
+lvhc_churn <- weekly_full %>%
+  semi_join(lvhc_clients, by = "Client ID") %>%
+  group_by(`Client ID`) %>%
+  summarise(
+    last_attended = max(week[weekly_visits > 0]),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    weeks_since = round(as.numeric(difftime(as.Date("2025-03-31"), last_attended, units = "weeks")))
+  ) %>%
+  filter(weeks_since >= 4)
+
+lvhc_churn
+```
+
+#This section isolates members who have recently lapsed, providing actionable insight for re-engagement strategies.
+```{r}
+if (nrow(lvhc_churn) > 0) {
+  churn_trajectories <- weekly_full %>%
+    filter(`Client ID` %in% lvhc_churn$`Client ID`) %>%
+    left_join(
+      df_clean %>%
+        group_by(`Client ID`) %>%
+        summarise(Location = first(Location), .groups = "drop") %>%
+        mutate(`Client ID` = as.character(`Client ID`),
+               Location = as.character(Location)),
+      by = "Client ID"
+    ) %>%
+    left_join(
+      lvhc_churn %>% select(`Client ID`, last_attended),
+      by = "Client ID"
+    ) %>%
+    mutate(
+      period = ifelse(week > last_attended, "Post-Churn", "Pre-Churn")
+    )
+  ggplot(churn_trajectories, aes(x = week, y = weekly_visits, color = period)) +
+    geom_line(linewidth = 1) +
+    facet_wrap(~ `Client ID`) +
+    scale_color_manual(values = c("Pre-Churn" = "steelblue", "Post-Churn" = "red")) +
+    labs(
+      title = "Figure 11: Drop-Off Patterns in LVHC Attendance",
+      x = "Week", y = "Visits", color = "Period"
+    ) +
+    theme_minimal()
+} else {
+  print("No LVHC clients identified as churned.")
+}
+
+```
