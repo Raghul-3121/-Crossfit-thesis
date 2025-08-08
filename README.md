@@ -12,7 +12,6 @@ The analysis focuses on going beyond basic frequency-based segmentation by incor
 |------|-------------|
 | `Crossfit-Analysis-Code.Rmd` | The complete R Markdown script used for data cleaning, clustering, metric computation, and all figures in the report. |
 | `CrossFit_Gym_Dataset.csv` | The anonymised attendance dataset used in the study. |
-| `Final_Report.pdf` *(optional)* | The written thesis report submitted for academic evaluation (to be added if required). |
 
 ---
 
